@@ -1,0 +1,1 @@
+Este repositório contém um laboratório didático em Python desenvolvido para demonstrar conceitos fundamentais de Sistemas Distribuídos, focando em comunicação via sockets TCP, troca de batimentos cardíacos (heartbeats), replicação de estado e detecção de falhas por timeout.
