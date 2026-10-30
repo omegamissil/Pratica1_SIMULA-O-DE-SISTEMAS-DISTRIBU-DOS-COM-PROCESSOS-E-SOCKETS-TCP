@@ -1,0 +1,162 @@
+import json
+import multiprocessing as mp
+import socket
+import socketserver
+import threading
+import time
+from datetime import datetime
+
+HOST = "127.0.0.1"
+TIMEOUT_FALHA = 2.0
+# Definimos a lista de nós para facilitar a escalabilidade
+NODES = ("A", "B", "C", "D")
+
+
+def registrar(texto):
+    print(f"[{datetime.now():%H:%M:%S}] {texto}", flush=True)
+
+
+def requisitar(porta, pedido):
+    """Protocolo: uma requisição/resposta JSON por linha em TCP."""
+    with socket.create_connection((HOST, porta), timeout=2.0) as conexao:
+        conexao.sendall((json.dumps(pedido) + "\n").encode("utf-8"))
+        with conexao.makefile("r", encoding="utf-8") as entrada:
+            return json.loads(entrada.readline())
+
+
+class EstadoCompartilhado:
+    def __init__(self):
+        self.trava = threading.Lock()
+        self.versao = 0
+        self.dados = {"produto": "livro", "estoque": 10}
+        self.ultimo_contato = {}
+
+    def tratar(self, mensagem):
+        tipo = mensagem.get("tipo")
+        identificador = mensagem.get("id")
+        with self.trava:
+            if tipo in ("REGISTRAR", "PULSO"):
+                if identificador not in NODES:
+                    return {"erro": "identificador desconhecido"}
+                self.ultimo_contato[identificador] = time.monotonic()
+                versao_cliente = mensagem.get("versao", -1)
+                resposta = {"ok": True, "versao": self.versao}
+                # A cópia completa só é enviada quando a versão mudou.
+                if versao_cliente != self.versao:
+                    resposta["dados"] = self.dados.copy()
+                return resposta
+            if tipo == "ATUALIZAR":
+                self.versao += 1
+                self.dados["estoque"] = int(mensagem["estoque"])
+                return {"ok": True, "versao": self.versao}
+            if tipo == "STATUS":
+                agora = time.monotonic()
+                situacao = {}
+                for nome in NODES:
+                    ultimo = self.ultimo_contato.get(nome)
+                    situacao[nome] = (
+                        "ATIVO" if ultimo is not None and agora - ultimo < TIMEOUT_FALHA
+                        else "SEM CONTATO"
+                    )
+                return {"versao": self.versao, "dados": self.dados.copy(),
+                        "trabalhadores": situacao}
+            return {"erro": "operacao desconhecida"}
+
+
+class AtendenteTCP(socketserver.StreamRequestHandler):
+    def handle(self):
+        try:
+            linha = self.rfile.readline()  # delimitação explícita por \n
+            pedido = json.loads(linha.decode("utf-8"))
+            resposta = self.server.estado.tratar(pedido)
+        except (ValueError, KeyError, UnicodeDecodeError) as erro:
+            resposta = {"erro": str(erro)}
+        self.wfile.write((json.dumps(resposta) + "\n").encode("utf-8"))
+
+
+class ServidorTCP(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+def trabalhador(nome, porta):
+    """Cada trabalhador executa em um processo do sistema operacional."""
+    versao_local = -1
+    registrar(f"Nó {nome}: iniciado em PID={mp.current_process().pid}")
+    while True:
+        try:
+            tipo = "REGISTRAR" if versao_local < 0 else "PULSO"
+            resposta = requisitar(porta, {"tipo": tipo, "id": nome,
+                                          "versao": versao_local})
+            if "dados" in resposta:
+                versao_local = resposta["versao"]
+                registrar(f"Nó {nome}: versão={versao_local}; "
+                          f"réplica={resposta['dados']}")
+            time.sleep(0.55)
+        except (OSError, ValueError) as erro:
+            registrar(f"Nó {nome}: comunicação interrompida: {erro}")
+            time.sleep(0.7)
+
+
+def mostrar_status(porta, titulo):
+    resposta = requisitar(porta, {"tipo": "STATUS"})
+    registrar(f"{titulo}: {resposta['trabalhadores']} "
+              f"| dados={resposta['dados']} (v{resposta['versao']})")
+
+
+def main():
+    # A porta 0 faz o sistema escolher uma porta TCP local disponível.
+    with ServidorTCP((HOST, 0), AtendenteTCP) as servidor:
+        servidor.estado = EstadoCompartilhado()
+        porta = servidor.server_address[1]
+        thread = threading.Thread(target=servidor.serve_forever, daemon=True)
+        thread.start()
+        registrar(f"Coordenador TCP ativo em {HOST}:{porta}")
+
+        contexto = mp.get_context("spawn")  # funciona também no Windows
+        nos = {}
+        try:
+            # Inicializa os processos de A até D iterando sobre a tupla NODES
+            for nome in NODES:
+                nos[nome] = contexto.Process(target=trabalhador, args=(nome, porta))
+                nos[nome].start()
+            
+            # O tempo de inicialização de subprocessos varia em cada computador.
+            limite = time.monotonic() + 15
+            while time.monotonic() < limite:
+                status = requisitar(porta, {"tipo": "STATUS"})["trabalhadores"]
+                if all(valor == "ATIVO" for valor in status.values()):
+                    break
+                time.sleep(0.2)
+            mostrar_status(porta, "1. Estado inicial dos quatro processos (A, B, C e D)")
+
+            resposta = requisitar(porta, {"tipo": "ATUALIZAR", "estoque": 7})
+            registrar(f"Professor: estoque alterado para 7 (v{resposta['versao']})")
+            time.sleep(1.3)
+
+            registrar("2. Simulando falha do nó B...")
+            nos["B"].terminate()
+            nos["B"].join(timeout=2)
+            time.sleep(TIMEOUT_FALHA + 0.5)
+            mostrar_status(porta, "3. Detecção por timeout")
+
+            requisitar(porta, {"tipo": "ATUALIZAR", "estoque": 5})
+            registrar("Professor: estoque alterado para 5 durante a falha")
+            registrar("4. Reiniciando o nó B...")
+            nos["B"] = contexto.Process(target=trabalhador, args=("B", porta))
+            nos["B"].start()
+            time.sleep(1.6)
+            mostrar_status(porta, "5. Nó B recuperou a versão mais recente")
+        finally:
+            for processo in nos.values():
+                if processo.is_alive():
+                    processo.terminate()
+                processo.join(timeout=2)
+            servidor.shutdown()
+            thread.join(timeout=2)
+            registrar("Demonstração encerrada.")
+
+
+if __name__ == "__main__":
+    mp.freeze_support()
+    main()
